@@ -30,6 +30,7 @@ The batch file will create a bin directory, and copy all binary files, including
 
 The recommended alternative is to load NATS.sln into Visual Studio 2013 Express or better.  Later versions of Visual Studio should automatically upgrade the solution and project files for you.  XML documenation is generated, so code completion, context help, etc, will be available in the editor.
 
+
 #### Project files
 
 The NATS Visual Studio Solution contains several projects, listed below.
@@ -45,6 +46,22 @@ The NATS Visual Studio Solution contains several projects, listed below.
   * Replier - A sample replier for the Requestor application.
 
 All examples provide statistics for benchmarking.
+
+### NuGet
+
+The NATS .NET Client can be found in the NuGet Gallery.  It can be found as the [NATS.Client Package](https://www.nuget.org/packages/NATS.Client).
+
+### Building the API Documentation
+Doxygen is used for building the API documentation.  To build the API documentation, change directories to `documentation` and run the following command:
+
+```
+build_doc.bat
+```
+
+Doxygen will build the NATS .NET Client API documentation, placing it in the `documentationr\NATS.Client\html` directory.
+Doxygen is required to be installed and in the PATH.  Version 1.8 is known to work.
+
+[Current API Documentation](http://htmlpreview.github.io/?https://github.com/nats-io/csnats/blob/master/documentation/NATS.Client/html/index.html)
 
 ## Basic Usage
 
@@ -77,34 +94,38 @@ Here are example snippets of using the API to create a connection, subscribe, pu
             // Creates a live connection to the default
             // NATS Server running locally
             IConnection c = cf.CreateConnection();
-
-            // Simple asynchronous subscriber on subject foo
-            IAsyncSubscription sAsync = c.SubscribeAsync("foo");
-
-            // Assign a message handler.  An anonymous delegate function
-            // is used for brevity.
-            sAsync.MessageHandler += (sender, msgArgs) =>
+            
+            // Setup an event handler to process incoming messages.
+            // An anonymous delegate function is used for brevity.
+            EventHandler<MsgHandlerEventArgs> h = (sender, args) =>
             {
                 // print the message
-                Console.WriteLine(msgArgs.Message);
+                Console.WriteLine(args.Message);
 
                 // Here are some of the accessible properties from
                 // the message:
-                // msgArgs.Message.Data;
-                // msgArgs.Message.Reply;
-                // msgArgs.Message.Subject;
-                // msgArgs.Message.ArrivalSubcription.Subject;
-                // msgArgs.Message.ArrivalSubcription.QueuedMessageCount;
-                // msgArgs.Message.ArrivalSubcription.Queue;
+                // args.Message.Data;
+                // args.Message.Reply;
+                // args.Message.Subject;
+                // args.Message.ArrivalSubcription.Subject;
+                // args.Message.ArrivalSubcription.QueuedMessageCount;
+                // args.Message.ArrivalSubcription.Queue;
 
                 // Unsubscribing from within the delegate function is supported.
-                msgArgs.Message.ArrivalSubcription.Unsubscribe();
+                args.Message.ArrivalSubcription.Unsubscribe();
             };
 
-            // Start the subscriber.  Asycnronous subscribers have a
-            // method to start receiving data.  This allows the message handler
-            // to be setup before data starts arriving; important if multicasting
-            // delegates.
+            // The simple way to create an asynchronous subscriber
+            // is to simply pass the event in.  Messages will start
+            // arriving immediately.
+            IAsyncSubscription s = c.SubscribeAsync("foo", h);
+
+            // Alternatively, create an asynchronous subscriber on subject foo, 
+            // assign a message handler, then start the subscriber.   When
+            // multicasting delegates, this allows all message handlers
+            // to be setup before messages start arriving.
+            IAsyncSubscription sAsync = c.SubscribeAsync("foo");
+            sAsync.MessageHandler += h;
             sAsync.Start();
 
             // Simple synchronous subscriber
@@ -130,6 +151,80 @@ Here are example snippets of using the API to create a connection, subscribe, pu
 
             // Closing a connection
             c.Close();
+```
+## Basic Encoded Usage
+The .NET NATS client mirrors go encoding through serialization and
+deserialization.  Simply create an encoded connection and publish
+objects, and receive objects through an asyncronous subscription using
+the encoded message event handler.  By default, objects are serialized
+using the BinaryFormatter, but methods used to serialize and deserialize
+objects can be overridden.
+
+```C#
+        using (IEncodedConnection c = new ConnectionFactory().CreateEncodedConnection())
+        {
+            EventHandler<EncodedMessageEventArgs> eh = (sender, args) =>
+            {
+                // Here, obj is an instance of the object published to 
+                // this subscriber.  Retrieve it through the
+                // ReceivedObject property of the arguments.
+                MyObject obj = (MyObject)args.ReceivedObject;
+
+                System.Console.WriteLine("Company: " + obj.Company);
+            };
+
+            // Subscribe using the encoded message event handler
+            IAsyncSubscription s = c.SubscribeAsync("foo", eh);
+
+            MyObject obj = new MyObject();
+            obj.Company = "Apcera";
+            
+            // To publish an instance of your object, simply
+            // call the IEncodedConnection publish API and pass
+            // your object.
+            c.Publish("foo", obj);
+            c.Flush();
+        }
+```
+
+### Other Types of Serialization
+Optionally, one can override serialization.  Depending on the level of support or 
+third party packages used, objects can be serialized to JSON, SOAP, or a custom
+scheme.  XML was chosen as the example here as it is natively supported 
+in all versions of .NET.
+
+```C#
+        // Example XML serialization.
+        byte[] serializeToXML(Object obj)
+        {
+            MemoryStream  ms = new MemoryStream();
+            XmlSerializer x = new XmlSerializer(((SerializationTestObj)obj).GetType());
+
+            x.Serialize(ms, obj);
+
+            byte[] content = new byte[ms.Position];
+            Array.Copy(ms.GetBuffer(), content, ms.Position);
+
+            return content;
+        }
+
+        Object deserializeFromXML(byte[] data)
+        {
+            XmlSerializer x = new XmlSerializer(new SerializationTestObj().GetType());
+            MemoryStream ms = new MemoryStream(data);
+            return x.Deserialize(ms);
+        }
+        
+        <...>
+        
+        // Create an encoded connection and override the OnSerialize and
+        // OnDeserialize delegates.
+        IEncodedConnection c = new ConnectionFactory().CreateEncodedConnection();
+        c.OnDeserialize = deserializeFromXML;
+        c.OnSerialize = serializeToXML;
+        
+        // From here on, the connection will use the custom delegates
+        // for serialization.
 ```
 
 ## Wildcard Subscriptions
@@ -185,7 +280,7 @@ ISyncSubscription s1 = c.SubscribeSync("foo", "job_workers");
 or
 
 ```C#
-IAsyncSubscription s = c.SubscribeAsync("foo", "job_workers");
+IAsyncSubscription s = c.SubscribeAsync("foo", "job_workers", myHandler);
 ```
 
 To unsubscribe, call the ISubscriber Unsubscribe method:
@@ -298,6 +393,57 @@ Other events can be assigned delegate methods through the options object.
             IConnection c = new ConnectionFactory().CreateConnection(opts);
 ```
 
+## TLS
+The NATS .NET client supports TLS 1.2.  Set the secure option, add
+the certificate, and connect.  Note that .NET requires both the 
+private key and certificate to be present in the same certificate file.
+
+```C#
+        Options opts = ConnectionFactory.GetDefaultOptions();
+        opts.Secure = true;
+        
+        // .NET requires the private key and cert in the 
+        //  same file. 'client.pfx' is generated from:
+        //
+        // openssl pkcs12 -export -out client.pfx 
+        //    -inkey client-key.pem -in client-cert.pem
+        X509Certificate2 cert = new X509Certificate2("client.pfx", "password");
+
+        opts.AddCertificate(cert);
+
+        IConnection c = new ConnectionFactory().CreateConnection(opts);
+```
+Many times, it is useful when developing an application (or necessary 
+when using self-signed certificates) to override server certificate
+validation.  This is achieved by overriding the remove certificate
+validation callback through the NATS client options.
+```C#
+        
+    private bool verifyServerCert(object sender,
+        X509Certificate certificate, X509Chain chain,
+                SslPolicyErrors sslPolicyErrors)
+        {
+            if (sslPolicyErrors == SslPolicyErrors.None)
+                return true;
+
+            // Do what is necessary to achieve the level of
+            // security you need given a policy error.
+        }        
+        
+        <...>
+        
+        Options opts = ConnectionFactory.GetDefaultOptions();
+        opts.Secure = true;
+        opts.TLSRemoteCertificationValidationCallback = verifyServerCert;
+        opts.AddCertificate("client.pfx");
+        
+        IConnection c = new ConnectionFactory().CreateConnection(opts);
+```
+The NATS server default cipher suites **may not be supported** by the Microsoft
+.NET framework.  Please refer to **gnatsd --help_tls** usage and configure
+the  NATS server to include the most secure cipher suites supported by the
+.NET framework.
+
 ## Exceptions
 
 The NATS .NET client can throw the following exceptions:
@@ -315,15 +461,17 @@ The NATS .NET client can throw the following exceptions:
 * NATSTimeoutException - The exception that is thrown when a NATS operation times out.
 
 ## Miscellaneous 
-Known Issues
+###Known Issues
 * Some unit tests are incomplete or fail.  This is due to long connect times with the underlying .NET TCPClient API, issues with the tests themselves, or bugs (This IS an alpha).
-* There can be an issue with a flush hanging in some situations.  I'm looking into it.
+* In the original v0.1-alpha release, there was an issue with a flush hanging in some situations.  This has been fixed in the v0.2-alpha release.
 
-TODO
-* API documentation
-* WCF bindings
-* Strong name the assembly
-
+###TODO
+* [ ] WCF bindings
+* [X] TLS
+* [X] Encoding (Serialization/Deserialization)
+* [X] Update delegates from traditional model to custom
+* [X] NuGet package
+* [X] Strong name the assembly
 
 ## License
 

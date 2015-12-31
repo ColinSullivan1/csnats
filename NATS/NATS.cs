@@ -8,12 +8,31 @@ using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
 
+/*! \mainpage %NATS .NET client.
+ *
+ * \section intro_sec Introduction
+ *
+ * The %NATS .NET Client is part of %NATS an open-source, cloud-native 
+ * messaging system, and is supported by [Apcera](http://www.apcera.com).
+ * This client, written in C#, follows the go client closely, but
+ * diverges in places to follow the common design semantics of a .NET API.
+ *
+ * \section install_sec Installation
+ * 
+ * Instructions to build and install the %NATS .NET C# client can be
+ * found at the [NATS .NET C# GitHub page](https://github.com/nats-io/csnats)
+ *
+ * \section other_doc_section Other Documentation
+ * 
+ * This documentation focuses on the %NATS .NET C# Client API; for additional
+ * information, refer to the following:
+ * 
+ * - [General Documentation for nats.io](http://nats.io/documentation) 
+ * - [NATS .NET C# Client found on GitHub](https://github.com/nats-io/csnats) 
+ * - [The NATS server (gnatsd) found on GitHub](https://github.com/nats-io/gnatsd)
+ */
 
-// This is the NATS .NET client.
-// 
-// This Apcera supported client library follows the go client closely, 
-// diverging where it makes sense to follow the common design 
-// semantics of the language.
+// Notes on the NATS .NET client.
 // 
 // While public and protected methods 
 // and properties adhere to the .NET coding guidlines, 
@@ -29,7 +48,7 @@ using System.Threading.Tasks;
 //     - Public members are accessed through a property.
 //     - When possible, internal members are accessed directly.
 //     - Internal Variable Names mirror those of the go client.
-//     - A minimal/no reliance on third party packages.
+//     - Minimal/no reliance on third party packages.
 //
 //     Coding guidelines are based on:
 //     http://blogs.msdn.com/b/brada/archive/2005/01/26/361363.aspx
@@ -102,25 +121,26 @@ namespace NATS.Client
          * Namespace level defaults
          */
 
-	    // Scratch storage for assembling protocol headers
-	    internal const int scratchSize = 512;
+        // Scratch storage for assembling protocol headers
+        internal const int scratchSize = 512;
 
-	    // The size of the bufio reader/writer on top of the socket.
-        // .NET perform better with small buffer sizes.
-        internal const int defaultBufSize    = 32512;
-        internal const int defaultReadLength = 512;
+        // The size of the bufio writer on top of the socket.
+        internal const int defaultBufSize = 32768;
 
-	    // The size of the bufio while we are reconnecting
+        // The read size from the network stream.
+        internal const int defaultReadLength = 20480;
+
+        // The size of the bufio while we are reconnecting
         internal const int defaultPendingSize = 1024 * 1024;
 
-	    // Default server pool size
+        // Default server pool size
         internal const int srvPoolSize = 4;
     }
 
     /// <summary>
     /// Event arguments for the ConnEventHandler type delegate.
     /// </summary>
-    public class ConnEventArgs
+    public class ConnEventArgs : EventArgs
     {
         private Connection c;   
             
@@ -141,7 +161,7 @@ namespace NATS.Client
     /// <summary>
     /// Event arguments for the ErrorEventHandler type delegate.
     /// </summary>
-    public class ErrEventArgs
+    public class ErrEventArgs : EventArgs
     {
         private Connection c;
         private Subscription s;
@@ -177,22 +197,7 @@ namespace NATS.Client
         {
             get { return err; }
         }
-
     }
-
-    /// <summary>
-    /// Delegate to handle a connection related event.
-    /// </summary>
-    /// <param name="sender">Sender object.</param>
-    /// <param name="e">Event arguments</param>
-    public delegate void ConnEventHandler(object sender, ConnEventArgs e);
-
-    /// <summary>
-    /// Delegate to handle error events.
-    /// </summary>
-    /// <param name="sender">Sender object.</param>
-    /// <param name="e">Sender object.</param>
-    public delegate void ErrorEventHandler(object sender, ErrEventArgs e);
 
     /**
      * Internal Constants
@@ -220,7 +225,8 @@ namespace NATS.Client
         internal const string subProto   = "SUB {0} {1} {2}" + IC._CRLF_;
         internal const string unsubProto = "UNSUB {0} {1}" + IC._CRLF_;
 
-        internal const string pongProtoNoCRLF = "PONG"; 
+        internal const string pongProtoNoCRLF = "PONG";
+        internal const string okProtoNoCRLF = "+OK";
 
         internal const string STALE_CONNECTION = "Stale Connection";
     }
@@ -229,7 +235,7 @@ namespace NATS.Client
     /// This class is passed into the MsgHandler delegate, providing the
     /// message received.
     /// </summary>
-    public class MsgHandlerEventArgs
+    public class MsgHandlerEventArgs : EventArgs
     {
         internal Msg msg = null;
 
@@ -241,11 +247,4 @@ namespace NATS.Client
             get { return msg; }
         }
     }
-   
-    /// <summary>
-    /// This delegate handles event raised when a message arrives.
-    /// </summary>
-    /// <param name="sender">Sender object.</param>
-    /// <param name="args">MsgHandlerEventArgs</param>
-    public delegate void MsgHandler(object sender, MsgHandlerEventArgs args);
 }

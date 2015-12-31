@@ -9,8 +9,11 @@ using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
 using System.Net.Sockets;
+using System.Net.Security;
+using System.Security.Cryptography.X509Certificates;
+using System.Security.Authentication;
 
-// disable XM comment warnings
+// disable XML comment warnings
 #pragma warning disable 1591
 
 namespace NATS.Client
@@ -34,7 +37,7 @@ namespace NATS.Client
         internal int Port;
         internal string Version;
         internal bool AuthRequired;
-        internal bool SslRequired;
+        internal bool TlsRequired;
         internal Int64 MaxPayload;
 
         Dictionary<string, string> parameters = new Dictionary<string, string>();
@@ -57,7 +60,7 @@ namespace NATS.Client
             Version = parameters["version"];
 
             AuthRequired = "true".Equals(parameters["auth_required"]);
-            SslRequired = "true".Equals(parameters["ssl_required"]);
+            TlsRequired = "true".Equals(parameters["tls_required"]);
             MaxPayload = Convert.ToInt64(parameters["max_payload"]);
         }
 
@@ -95,17 +98,18 @@ namespace NATS.Client
 
     }
 
-    /// <summary>
-    /// Represents the connection to the server.
-    /// </summary>
+    // TODO - for a pure object model, we can create
+    // an abstract subclass containing shared code between conn and 
+    // encoded conn rather than using this class as
+    // a base class.  This can happen anytime as we are using
+    // interfaces.
     public class Connection : IConnection, IDisposable
     {
         Statistics stats = new Statistics();
 
         // NOTE: We aren't using Mutex here to support enterprises using
         // .NET 4.0.
-        readonly object mu = new Object(); 
-
+        readonly internal object mu = new Object(); 
 
         private Random r = null;
 
@@ -147,25 +151,29 @@ namespace NATS.Client
 
         internal ConnState status = ConnState.CLOSED;
 
-        Exception lastEx;
+        internal Exception lastEx;
 
         Parser              ps = null;
         System.Timers.Timer ptmr = null;
 
         int                 pout = 0;
 
-        // Prepare static protocol messages to minimize encoding costs.
-        private byte[] pingProtoBytes = null;
-        private int    pingProtoBytesLen;
-        private byte[] pongProtoBytes = null;
-        private int    pongProtoBytesLen;
-        private byte[] _CRLF_AS_BYTES = Encoding.UTF8.GetBytes(IC._CRLF_);
+        // Prepare protocol messages for efficiency
+        private byte[] PING_P_BYTES = null;
+        private int    PING_P_BYTES_LEN;
 
-        // Use a string builder to generate protocol messages.
-        StringBuilder   publishSb    = new StringBuilder(Defaults.scratchSize);
+        private byte[] PONG_P_BYTES = null;
+        private int    PONG_P_BYTES_LEN;
+
+        private byte[] PUB_P_BYTES = null;
+        private int    PUB_P_BYTES_LEN = 0;
+
+        private byte[] CRLF_BYTES = null;
+        private int    CRLF_BYTES_LEN = 0;
+
+        byte[] pubProtoBuf = null;
 
         TCPConnection conn = new TCPConnection();
-
 
         internal class Control
         {
@@ -204,7 +212,7 @@ namespace NATS.Client
         /// Convenience class representing the TCP connection to prevent 
         /// managing two variables throughout the NATs client code.
         /// </summary>
-        private class TCPConnection
+        private sealed class TCPConnection
         {
             /// A note on the use of streams.  .NET provides a BufferedStream
             /// that can sit on top of an IO stream, in this case the network
@@ -214,27 +222,25 @@ namespace NATS.Client
             /// So, here's what we have for writing:
             ///     Client code
             ///          ->BufferedStream (bw)
-            ///              ->NetworkStream (srvStream)
+            ///              ->NetworkStream/SslStream (srvStream)
             ///                  ->TCPClient (srvClient);
             ///                  
             ///  For reading:
             ///     Client code
-            ///          ->NetworkStream (srvStream)
+            ///          ->NetworkStream/SslStream (srvStream)
             ///              ->TCPClient (srvClient);
             /// 
-            /// TODO:  Test various scenarios for efficiency.  Is a 
-            /// BufferedReader directly over a network stream really 
-            /// more efficient for NATS?
-            /// 
-            Object        mu     = new Object();
-            TcpClient     client = null;
-            NetworkStream stream = null;
+            Object        mu        = new Object();
+            TcpClient     client    = null;
+            NetworkStream stream    = null;
+            SslStream     sslStream = null;
+
+            string        hostName  = null;
 
             internal void open(Srv s, int timeoutMillis)
             {
                 lock (mu)
                 {
-
                     client = new TcpClient(s.url.Host, s.url.Port);
 #if async_connect
                     client = new TcpClient();
@@ -251,10 +257,51 @@ namespace NATS.Client
 
                     client.NoDelay = false;
 
-                    client.ReceiveBufferSize = Defaults.defaultBufSize;
+                    client.ReceiveBufferSize = Defaults.defaultBufSize*2;
                     client.SendBufferSize    = Defaults.defaultBufSize;
 
                     stream = client.GetStream();
+
+                    // save off the hostname
+                    hostName = s.url.Host;
+                }
+            }
+
+            private static bool remoteCertificateValidation(
+                  object sender,
+                  X509Certificate certificate,
+                  X509Chain chain,
+                  SslPolicyErrors sslPolicyErrors)
+            {
+                if (sslPolicyErrors == SslPolicyErrors.None)
+                    return true;
+
+                return false;
+            }
+
+            internal void makeTLS(Options options)
+            {
+                RemoteCertificateValidationCallback cb = null;
+
+                if (stream == null)
+                    throw new NATSException("Internal error:  Cannot create SslStream from null stream.");
+
+                cb = options.TLSRemoteCertificationValidationCallback;
+                if (cb == null)
+                    cb = remoteCertificateValidation;
+
+                sslStream = new SslStream(stream, false, cb, null,
+                    EncryptionPolicy.RequireEncryption);
+
+                try
+                {
+                    SslProtocols protocol = (SslProtocols)Enum.Parse(typeof(SslProtocols), "Tls12");
+                    sslStream.AuthenticateAsClient(hostName, options.certificates, protocol, true);
+                }
+                catch (AuthenticationException ex)
+                {
+                    client.Close();
+                    throw new NATSConnectionException("TLS Authentication error", ex);
                 }
             }
 
@@ -306,12 +353,22 @@ namespace NATS.Client
 
             internal Stream getReadBufferedStream()
             {
+                if (sslStream != null)
+                    return sslStream;
+
                 return stream;
             }
 
             internal Stream getWriteBufferedStream(int size)
             {
-                return new BufferedStream(stream, size);
+                BufferedStream bs = null;
+
+                if (sslStream != null)
+                    bs = new BufferedStream(sslStream, size);
+                else
+                    bs = new BufferedStream(stream, size);
+
+                return bs;
             }
 
             internal bool Connected
@@ -396,13 +453,30 @@ namespace NATS.Client
 
         internal Connection(Options opts)
         {
-            this.opts = opts;
+            this.opts = new Options(opts);
             this.pongs = createPongs();
             this.ps = new Parser(this);
-            this.pingProtoBytes = System.Text.Encoding.UTF8.GetBytes(IC.pingProto);
-            this.pingProtoBytesLen = pingProtoBytes.Length;
-            this.pongProtoBytes = System.Text.Encoding.UTF8.GetBytes(IC.pongProto);
-            this.pongProtoBytesLen = pongProtoBytes.Length;
+
+            PING_P_BYTES = System.Text.Encoding.UTF8.GetBytes(IC.pingProto);
+            PING_P_BYTES_LEN = PING_P_BYTES.Length;
+
+            PONG_P_BYTES = System.Text.Encoding.UTF8.GetBytes(IC.pongProto);
+            PONG_P_BYTES_LEN = PONG_P_BYTES.Length;
+
+            PUB_P_BYTES = Encoding.UTF8.GetBytes(IC._PUB_P_);
+            PUB_P_BYTES_LEN = PUB_P_BYTES.Length;
+
+            CRLF_BYTES = Encoding.UTF8.GetBytes(IC._CRLF_);
+            CRLF_BYTES_LEN = CRLF_BYTES.Length;
+
+            // predefine the start of the publish protocol message.
+            buildPublishProtocolBuffer(Defaults.scratchSize);
+        }
+
+        private void buildPublishProtocolBuffer(int size)
+        {
+            pubProtoBuf = new byte[size];
+            Buffer.BlockCopy(PUB_P_BYTES, 0, pubProtoBuf, 0, PUB_P_BYTES_LEN);
         }
 
 
@@ -552,8 +626,9 @@ namespace NATS.Client
         // makeSecureConn will wrap an existing Conn using TLS
         private void makeTLSConn()
         {
-            // TODO:  Notes... SSL for beta?  Encapsulate/overide writes to work with SSL and
-            // standard streams.  Buffered writer with an SSL stream?
+            conn.makeTLS(this.opts);
+            bw = conn.getWriteBufferedStream(Defaults.defaultBufSize);
+            br = conn.getReadBufferedStream();
         }
 
         // waitForExits will wait for all socket watcher Go routines to
@@ -648,9 +723,6 @@ namespace NATS.Client
             }
         }
 
-        /// <summary>
-        /// Returns the id of the server currently connected.
-        /// </summary>
         public string ConnectedId
         {
             get
@@ -745,11 +817,11 @@ namespace NATS.Client
         {
             // Check to see if we need to engage TLS
             // Check for mismatch in setups
-            if (Opts.Secure && info.SslRequired)
+            if (Opts.Secure && !info.TlsRequired)
             {
                 throw new NATSSecureConnWantedException();
             }
-            else if (info.SslRequired && !Opts.Secure)
+            else if (info.TlsRequired && !Opts.Secure)
             {
                 throw new NATSSecureConnRequiredException();
             }
@@ -859,7 +931,7 @@ namespace NATS.Client
             try
             {
                 writeString(connectProto());
-                bw.Write(pingProtoBytes, 0, pingProtoBytesLen);
+                bw.Write(PING_P_BYTES, 0, PING_P_BYTES_LEN);
                 bw.Flush();
             }
             catch (Exception ex)
@@ -873,6 +945,13 @@ namespace NATS.Client
             {
                 StreamReader sr = new StreamReader(br);
                 result = sr.ReadLine();
+
+
+                // If opts.verbose is set, handle +OK.
+                if (opts.Verbose == true && IC.okProtoNoCRLF.Equals(result))
+                {
+                    result = sr.ReadLine();
+                }
 
                 // Do not close or dispose the stream reader; 
                 // we need the underlying BufferedStream.
@@ -928,7 +1007,7 @@ namespace NATS.Client
             if (lastEx == null)
                 return;
 
-            if (info.SslRequired)
+            if (info.TlsRequired)
                 lastEx = new NATSSecureConnRequiredException();
             else
                 lastEx = new NATSConnectionClosedException();
@@ -1097,7 +1176,7 @@ namespace NATS.Client
                 }
 
                 // get the event handler under the lock
-                ConnEventHandler reconnectedEh = Opts.ReconnectedEventHandler;
+                EventHandler<ConnEventArgs> reconnectedEh = Opts.ReconnectedEventHandler;
 
                 // Release the lock here, we will return below
                 Monitor.Exit(mu);
@@ -1234,11 +1313,18 @@ namespace NATS.Client
         }
 
         // Roll our own fast conversion - we know it's the right
-        // encoding.
+        // encoding. 
         char[] convertToStrBuf = new char[Defaults.scratchSize];
 
+        // Caller must ensure thread safety.
         private string convertToString(byte[] buffer, long length)
         {
+            // expand if necessary
+            if (length > convertToStrBuf.Length)
+            {
+                convertToStrBuf = new char[length];
+            }
+
             for (int i = 0; i < length; i++)
             {
                 convertToStrBuf[i] = (char)buffer[i];
@@ -1246,6 +1332,22 @@ namespace NATS.Client
 
             // This is the copy operation for msg arg strings.
             return new String(convertToStrBuf, 0, (int)length);
+        }
+
+        // Since we know we don't need to decode the protocol string,
+        // just copy the chars into bytes.  This increased
+        // publish peformance by 30% as compared to Encoding.
+        private int writeStringToBuffer(byte[] buffer, int offset, string value)
+        {
+            int length = value.Length;
+            int end = offset + length;
+
+            for (int i = 0; i < length; i++)
+            {
+                buffer[i+offset] = (byte)value[i];
+            }
+
+            return end;
         }
 
         // Here we go ahead and convert the message args into
@@ -1334,6 +1436,7 @@ namespace NATS.Client
         // async error handler if registered.
         void processSlowConsumer(Subscription s)
         {
+            lastEx = new NATSSlowConsumerException();
             if (opts.AsyncErrorEventHandler != null && !s.sc)
             {
                 new Task(() =>
@@ -1427,7 +1530,7 @@ namespace NATS.Client
         // server. The server uses this mechanism to detect dead clients.
         internal void processPing()
         {
-            sendProto(pongProtoBytes, pongProtoBytesLen);
+            sendProto(PONG_P_BYTES, PONG_P_BYTES_LEN);
         }
 
 
@@ -1509,16 +1612,47 @@ namespace NATS.Client
             }
         }
 
+        // Use low level primitives to build the protocol for the publish
+        // message.
+        private int writePublishProto(byte[] dst, string subject, string reply, int msgSize)
+        {
+            // skip past the predefined "PUB "
+            int index = PUB_P_BYTES_LEN;
+
+            // Subject
+            index = writeStringToBuffer(dst, index, subject);
+
+            if (reply != null)
+            {
+                // " REPLY"
+                dst[index] = (byte)' ';
+                index++;
+
+                index = writeStringToBuffer(dst, index, reply);
+            }
+
+            // " "
+            dst[index] = (byte)' ';
+            index++;
+
+            // " SIZE"
+            index = writeStringToBuffer(dst, index, msgSize.ToString());
+
+            // "\r\n"
+            Buffer.BlockCopy(CRLF_BYTES, 0, dst, index, CRLF_BYTES_LEN);
+            index += CRLF_BYTES_LEN;
+
+            return index;
+        }
+
         // publish is the internal function to publish messages to a nats-server.
         // Sends a protocol data message by queueing into the bufio writer
         // and kicking the flush go routine. These writes should be protected.
-        private void publish(string subject, string reply, byte[] data)
+        internal void publish(string subject, string reply, byte[] data)
         {
             if (string.IsNullOrWhiteSpace(subject))
             {
-                throw new ArgumentException(
-                    "Subject cannot be null, empty, or whitespace.",
-                    "subject");
+                throw new NATSBadSubscriptionException();
             }
 
             int msgSize = data != null ? data.Length : 0;
@@ -1535,34 +1669,34 @@ namespace NATS.Client
                 if (lastEx != null)
                     throw lastEx;
 
-                // .NET is very performant using string builder.
-                publishSb.Clear();
-
-                if (reply == null)
+                int pubProtoLen;
+                // write our pubProtoBuf buffer to the buffered writer.
+                try
                 {
-                    publishSb.Append(IC._PUB_P_);
-                    publishSb.Append(" ");
-                    publishSb.Append(subject);
-                    publishSb.Append(" ");
+                    pubProtoLen = writePublishProto(pubProtoBuf, subject,
+                        reply, msgSize);
                 }
-                else
+                catch (IndexOutOfRangeException)
                 {
-                    publishSb.Append(IC._PUB_P_ + " " + subject + " " +
-                        reply + " ");
+                    // We can get here if we have very large subjects.
+                    // Expand with some room to spare.
+                    int resizeAmount = Defaults.scratchSize + subject.Length
+                        + (reply != null ? reply.Length : 0);
+
+                    buildPublishProtocolBuffer(resizeAmount);
+
+                    pubProtoLen = writePublishProto(pubProtoBuf, subject,
+                        reply, msgSize);
                 }
 
-                publishSb.Append(msgSize);
-                publishSb.Append(IC._CRLF_);
-
-                byte[] sendBytes = System.Text.Encoding.UTF8.GetBytes(publishSb.ToString());
-                bw.Write(sendBytes, 0, sendBytes.Length);
+                bw.Write(pubProtoBuf, 0, pubProtoLen);
 
                 if (msgSize > 0)
                 {
                     bw.Write(data, 0, msgSize);
                 }
 
-                bw.Write(_CRLF_AS_BYTES, 0, _CRLF_AS_BYTES.Length);
+                bw.Write(CRLF_BYTES, 0, CRLF_BYTES_LEN);
 
                 stats.outMsgs++;
                 stats.outBytes += msgSize;
@@ -1587,7 +1721,7 @@ namespace NATS.Client
             publish(subject, reply, data);
         }
 
-        private Msg request(string subject, byte[] data, int timeout)
+        internal virtual Msg request(string subject, byte[] data, int timeout)
         {
             Msg    m     = null;
             string inbox = NewInbox();
@@ -1637,7 +1771,7 @@ namespace NATS.Client
             return IC.inboxPrefix + BitConverter.ToString(buf).Replace("-","");
         }
 
-        internal void sendSubscriptonMessage(AsyncSubscription s)
+        internal void sendSubscriptionMessage(AsyncSubscription s)
         {
             lock (mu)
             {
@@ -1657,7 +1791,8 @@ namespace NATS.Client
             subs[s.sid] = s;
         }
 
-        private AsyncSubscription subscribeAsync(string subject, string queue)
+        internal AsyncSubscription subscribeAsync(string subject, string queue,
+            EventHandler<MsgHandlerEventArgs> handler)
         {
             AsyncSubscription s = null;
 
@@ -1669,6 +1804,12 @@ namespace NATS.Client
                 s = new AsyncSubscription(this, subject, queue);
 
                 addSubscription(s);
+
+                if (handler != null)
+                {
+                    s.MessageHandler += handler;
+                    s.Start();
+                }
             }
 
             return s;
@@ -1709,7 +1850,12 @@ namespace NATS.Client
 
         public IAsyncSubscription SubscribeAsync(string subject)
         {
-            return subscribeAsync(subject, null);
+            return subscribeAsync(subject, null, null);
+        }
+
+        public IAsyncSubscription SubscribeAsync(string subject, EventHandler<MsgHandlerEventArgs> handler)
+        {
+            return subscribeAsync(subject, null, handler);
         }
 
         public ISyncSubscription SubscribeSync(string subject, string queue)
@@ -1719,9 +1865,13 @@ namespace NATS.Client
 
         public IAsyncSubscription SubscribeAsync(string subject, string queue)
         {
-            return subscribeAsync(subject, queue);
+            return subscribeAsync(subject, queue, null);
         }
 
+        public IAsyncSubscription SubscribeAsync(string subject, string queue, EventHandler<MsgHandlerEventArgs> handler)
+        {
+            return subscribeAsync(subject, queue, handler);
+        }
         // unsubscribe performs the low level unsubscribe to the server.
         // Use Subscription.Unsubscribe()
         internal void unsubscribe(Subscription sub, int max)
@@ -1757,7 +1907,7 @@ namespace NATS.Client
             kickFlusher();
         }
 
-        internal void removeSub(Subscription s)
+        internal virtual void removeSub(Subscription s)
         {
             Subscription o;
 
@@ -1812,7 +1962,7 @@ namespace NATS.Client
             if (ch != null)
                 pongs.Enqueue(ch);
 
-            bw.Write(pingProtoBytes, 0, pingProtoBytesLen);
+            bw.Write(PING_P_BYTES, 0, PING_P_BYTES_LEN);
             bw.Flush();
         }
 
@@ -1910,17 +2060,6 @@ namespace NATS.Client
             bw.Flush();
         }
 
-
-        // Clear pending flush calls and reset
-        private void resetPendingFlush()
-        {
-            lock (mu)
-            {
-                clearPendingFlushCalls();
-                this.pongs = createPongs();
-            }
-        }
-
         // This will clear any pending flush calls and release pending calls.
         private void clearPendingFlushCalls()
         {
@@ -1944,8 +2083,8 @@ namespace NATS.Client
         // function. This function will handle the locking manually.
         private void close(ConnState closeState, bool invokeDelegates)
         {
-            ConnEventHandler disconnectedEventHandler = null;
-            ConnEventHandler closedEventHandler = null;
+            EventHandler<ConnEventArgs> disconnectedEventHandler = null;
+            EventHandler<ConnEventArgs> closedEventHandler = null;
 
             lock (mu)
             {

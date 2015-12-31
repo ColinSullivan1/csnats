@@ -20,6 +20,7 @@ namespace NATSUnitTests
         [TestInitialize()]
         public void Initialize()
         {
+            UnitTestUtilities.CleanupExistingServers();
             utils.StartDefaultServer();
         }
 
@@ -147,7 +148,7 @@ namespace NATSUnitTests
                 using (IAsyncSubscription s = c.SubscribeAsync("foo"))
                 {
                     asyncSub = s;
-                    s.MessageHandler += CheckRecveivedAndValidHandler;
+                    s.MessageHandler += CheckReceivedAndValidHandler;
                     s.Start();
 
                     lock (mu)
@@ -164,7 +165,7 @@ namespace NATSUnitTests
             }
         }
 
-        private void CheckRecveivedAndValidHandler(object sender, MsgHandlerEventArgs args)
+        private void CheckReceivedAndValidHandler(object sender, MsgHandlerEventArgs args)
         {
             System.Console.WriteLine("Received msg.");
 
@@ -600,10 +601,17 @@ namespace NATSUnitTests
         {
             using (IConnection c = new ConnectionFactory().CreateConnection())
             {
-                new Task(() => { c.Publish("foo", null); }).Start();
-                Thread.Sleep(200);
-
-                Assert.AreEqual(1, c.Stats.OutMsgs);
+                bool exThrown = false;
+                try
+                {
+                    c.Publish("", null);
+                }
+                catch (Exception e)
+                {
+                    if (e is NATSBadSubscriptionException)
+                        exThrown = true;
+                }
+                Assert.IsTrue(exThrown);
             }
         }
 
@@ -653,7 +661,6 @@ namespace NATSUnitTests
             {
                 using (IAsyncSubscription s = c.SubscribeAsync("foo"))
                 {
-                    Object testLock = new Object();
                     int received = 0;
                     int count = 1000;
 
@@ -670,15 +677,97 @@ namespace NATSUnitTests
                     }
                     c.Flush();
 
+                    Thread.Sleep(500);
+
                     if (received != count)
                     {
-                        Assert.Fail("Recieved ({0}) != count ({1})");
+                        Assert.Fail("Received ({0}) != count ({1})", received, count);
                     }
                 }
             }
         }
 
 
+        [TestMethod]
+        public void TestLargeSubjectAndReply()
+        {
+            using (IConnection c = new ConnectionFactory().CreateConnection())
+            {
+                String subject = "";
+                for (int i = 0; i < 1024; i++)
+                {
+                    subject += "A";
+                }
+
+                String reply = "";
+                for (int i = 0; i < 1024; i++)
+                {
+                    reply += "A";
+                }
+
+                using (IAsyncSubscription s = c.SubscribeAsync(subject))
+                {
+                    Object testLock = new Object();
+
+                    s.MessageHandler += (sender, args) =>
+                    {
+                        if (!subject.Equals(args.Message.Subject))
+                            Assert.Fail("Invalid subject received.");
+
+                        if (!reply.Equals(args.Message.Reply))
+                            Assert.Fail("Invalid subject received.");
+
+                        lock (testLock)
+                        {
+                            Monitor.Pulse(testLock);
+                        }
+                    };
+
+                    s.Start();
+
+                    c.Publish(subject, reply, null);
+                    c.Flush();
+
+                    lock (testLock)
+                    {
+                        Assert.IsTrue(Monitor.Wait(testLock, 1000));
+                    }
+                }
+            }
+        }
+
+        [TestMethod]
+        public void TestAsyncSubHandlerAPI()
+        {
+            using (IConnection c = new ConnectionFactory().CreateConnection())
+            {
+                int received = 0;
+
+                EventHandler<MsgHandlerEventArgs> h = (sender, args) =>
+                {
+                    Interlocked.Increment(ref received);
+                };
+
+                using (IAsyncSubscription s = c.SubscribeAsync("foo", h))
+                {
+                    c.Publish("foo", null);
+                    c.Flush();
+                    Thread.Sleep(500);
+                }
+
+                using (IAsyncSubscription s = c.SubscribeAsync("foo", "bar", h))
+                {
+                    c.Publish("foo", null);
+                    c.Flush();
+                    Thread.Sleep(500);
+                }
+
+                if (received != 2)
+                {
+                    Assert.Fail("Received ({0}) != 2", received);
+                }
+            }
+        }
 
     } // class
 
